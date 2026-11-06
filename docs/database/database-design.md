@@ -1,6 +1,8 @@
 # Database Design — Gym Management System (PostgreSQL / Django ORM)
 
 **Status:** Logical design (Phase 2, documentation only). No apps, models, or migrations exist. Names are model-class names for future Django apps; Django will generate physical tables as `<app_name>_<model_name_lower>` (e.g., `members_member`) when apps are created in a later phase. Nothing here has touched a database.
+**Amended 2026-11-06 (role consolidation, AD-13):** exactly two staff login roles — ADMIN and RECEPTIONIST. `TrainerProfile` was retitled **`Trainer`** and converted from a `User` profile extension into a standalone ADMIN-managed business record (no `User` FK, no authentication data). The entity count is unchanged (27). Details: [`../progress/phase-3-decisions.md`](../progress/phase-3-decisions.md).
+**Amended 2026-11-06 (second amendment, AD-14):** PostgreSQL 18 confirmed; KES single currency; payment methods CASH/MOBILE_MONEY/CARD/BANK_TRANSFER; cash-basis accounting; membership starts at full payment (dates set at activation); `AccessAttempt` extended for staff card/PIN events (`identity_kind`, `staff_actor_id`; biometric device becomes member-event specific); the offline entitlement cache lives on the device gateway — not in PostgreSQL.
 
 ---
 
@@ -37,13 +39,13 @@ Candidate list was 28 tables; after evaluation **`AttendanceEvent` was removed**
 | is_active | BOOLEAN | NOT NULL DEFAULT TRUE | deactivation instead of delete (audit preserves attribution) |
 | date_joined / last_login | TIMESTAMPTZ | NOT NULL / NULL | standard |
 
-Rows: 4 system roles seeded later (data migration, not executed in this phase). Users are NOT members (AD-02).
+Rows: exactly **2** system roles seeded later (ADMIN, RECEPTIONIST) — data migration, not executed in this phase. Trainers and accountants are business records managed by ADMIN and hold no `User` row (AD-13). Users are NOT members (AD-02).
 
 #### Role
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
 | id | BIGINT | PK | |
-| code | VARCHAR(32) | UNIQUE, NOT NULL | `ADMIN`, `RECEPTIONIST`, `TRAINER`, `ACCOUNTANT` |
+| code | VARCHAR(32) | UNIQUE, NOT NULL | `ADMIN`, `RECEPTIONIST` (the only seeded values — AD-13) |
 | name | VARCHAR(64) | NOT NULL | display |
 | description | TEXT | NULL | |
 
@@ -81,7 +83,7 @@ Indexes: UNIQUE(gym_member_id), UNIQUE(phone) [REC], UNIQUE(email) NULL-safe; su
 | price | NUMERIC(12,2) | NOT NULL, CHECK >= 0 | current price |
 | is_active | BOOLEAN | NOT NULL DEFAULT TRUE | ADMIN availability control |
 
-Note (BR-MEM-03): calendar-accurate durations. To express all five plans: DAILY(1, DAY), WEEKLY(7, DAY), MONTHLY(1, MONTH), QUARTERLY(3, MONTH), YEARLY(12, MONTH). Duration is used to compute `Membership.end_date` at creation; the plan row remains editable for pricing going forward — historical memberships snapshot it (AD-05).
+Note (BR-MEM-03): calendar-accurate durations. To express all five plans: DAILY(1, DAY), WEEKLY(7, DAY), MONTHLY(1, MONTH), QUARTERLY(3, MONTH), YEARLY(12, MONTH). Duration is used to compute `Membership.end_date` at activation; the plan row remains editable for pricing going forward — historical memberships snapshot it (AD-05).
 
 #### Membership (one member + one plan instance = one lifecycle)
 | Field | Type | Constraints | Notes |
@@ -90,12 +92,12 @@ Note (BR-MEM-03): calendar-accurate durations. To express all five plans: DAILY(
 | member_id | BIGINT | FK -> Member, PROTECT, NOT NULL | many historical memberships per member |
 | plan_id | BIGINT | FK -> MembershipPlan, PROTECT, NOT NULL | |
 | agreed_price | NUMERIC(12,2) | NOT NULL, CHECK >= 0 | snapshot of plan price at selection (BR-MEM-11) |
-| start_date | DATE | NOT NULL | **policy unresolved (BR-MEM-13)** |
-| end_date | DATE | NOT NULL, CHECK (end_date > start_date) | computed at creation from plan duration; stored as snapshot |
+| start_date | DATE | NULL until ACTIVE | set at activation — **confirmed policy (BR-MEM-13, 2026-11-06)**: start_date = date the full payment is received |
+| end_date | DATE | NULL until ACTIVE, CHECK (end_date > start_date) when set | computed at activation from plan duration; snapshot thereafter |
 | status | VARCHAR(16) | NOT NULL | PENDING_PAYMENT / ACTIVE / EXPIRED; CHECK constraint [REC] |
 | created_at | TIMESTAMPTZ | NOT NULL | |
 
-State machine lives in the membership service (BR-MEM-04/09/12); exactly-one-ACTIVE guard is a recommended partial unique index `(member_id) WHERE status = 'ACTIVE'` — pending confirmation of the single-active recommendation (BR-MEM-08 [REC]).
+State machine lives in the membership service (BR-MEM-04/09/12); exactly-one-ACTIVE guard is a recommended partial unique index `(member_id) WHERE status = 'ACTIVE'` — pending confirmation of the single-active recommendation (BR-MEM-08 [REC]). Snapshots (`agreed_price`, `start_date`, `end_date`) become immutable at activation (BR-MEM-10; start-date policy confirmed 2026-11-06).
 
 #### Payment
 | Field | Type | Constraints | Notes |
@@ -103,7 +105,7 @@ State machine lives in the membership service (BR-MEM-04/09/12); exactly-one-ACT
 | id | BIGINT | PK | |
 | membership_id | BIGINT | FK -> Membership, PROTECT, NOT NULL | many payments per membership |
 | amount | NUMERIC(12,2) | NOT NULL, CHECK (amount > 0) | |
-| method | VARCHAR(24) | NOT NULL | set unresolved (BR-MEM-14); recorded per payment |
+| method | VARCHAR(24) | NOT NULL | **confirmed set**: CASH / MOBILE_MONEY / CARD / BANK_TRANSFER (BR-MEM-14, 2026-11-06); recorded per payment |
 | status | VARCHAR(16) | NOT NULL | COMPLETED / REVERSED (append-only; corrections make reversal rows, BR-FIN-06) |
 | paid_at | TIMESTAMPTZ | NOT NULL | |
 | received_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | accountability |
@@ -177,40 +179,53 @@ Constraints: CHECK (check_out_at IS NULL OR check_out_at > check_in_at); **parti
 
 Partial UNIQUE (member_id, device_id, modality) WHERE status = 'ACTIVE'.
 
-#### AccessAttempt (biometric verification result + door decision, one event)
+#### AccessAttempt (verification result + door decision, one event — member and staff events)
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
 | id | BIGINT | PK | |
 | occurred_at | TIMESTAMPTZ | NOT NULL | |
-| member_id | BIGINT | FK -> Member, SET_NULL, NULL | NULL = unrecognized identity (BR-ACC-03) |
-| biometric_device_id | BIGINT | FK -> BiometricDevice, PROTECT, NOT NULL | verifying device |
+| member_id | BIGINT | FK -> Member, SET_NULL, NULL | NULL = unrecognized identity (BR-ACC-03) or staff event |
+| staff_actor_id | BIGINT | FK -> User, SET_NULL, NULL | acting staff `User` for card/PIN events (BR-ACC-11); NULL for member events |
+| identity_kind | VARCHAR(16) | NOT NULL | MEMBER / STAFF (BR-ACC-11; CHECK-rec per population rules below) |
+| biometric_device_id | BIGINT | FK -> BiometricDevice, PROTECT, NULL | **required for MEMBER rows**; NULL for staff card/PIN events |
 | access_device_id | BIGINT | FK -> AccessDevice, SET_NULL, NULL | NULL when verification ran without a door decision |
-| modality | VARCHAR(24) | NOT NULL | |
+| modality | VARCHAR(24) | NOT NULL | FINGERPRINT / FACIAL (member) · CARD / PIN (staff) |
 | verification_result | VARCHAR(24) | NOT NULL | MATCHED / NO_MATCH / TEMPLATE_UNREADABLE |
 | decision | VARCHAR(24) | NOT NULL | GRANTED / DENIED / OVERRIDE_GRANT |
 | deny_reason | VARCHAR(32) | NULL (required if DENIED) | MEMBERSHIP_PENDING / MEMBERSHIP_EXPIRED / UNKNOWN_IDENTITY / DEVICE_ERROR |
 | override_by_id | BIGINT | FK -> User, SET_NULL, NULL | receptionist/admin override accountability (BR-ACC-05) |
 | override_reason | TEXT | NULL | mandatory when OVERRIDE_GRANT |
 
+Recommended CHECKs (rec): `identity_kind = 'MEMBER'` ⇒ `staff_actor_id IS NULL`, `biometric_device_id IS NOT NULL`, member-oriented modalities; `identity_kind = 'STAFF'` ⇒ `member_id IS NULL`, `biometric_device_id IS NULL`, staff modalities, `staff_actor_id` populated at write time (SET_NULL retains history on user removal; audit attribution persists via `AuditLog`). Staff issuance/revocation of cards/PINs is an ADMIN-managed business process (accountability fields live in `AccessAttempt` + `AuditLog`; no separate credential table is proposed in v1 — flagged for confirmation if per-card/PIN registries are later required).
+
 Indexes: (occurred_at), (member_id), (decision).
 
 ### 2.5 Trainers & Workouts
 
-#### TrainerProfile
+#### Trainer (standalone business record — NO login account)
+
+> Amended 2026-11-06 (AD-13): formerly `TrainerProfile`, a OneToOne extension of a trainer-role `User`. With the role consolidation, trainers hold no staff accounts, so the record became a standalone entity carrying its own basic identity fields. The `User` FK and the role-TRAINER enforcement are removed; no trainer authentication model may be introduced.
+
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
 | id | BIGINT | PK | |
-| user_id | BIGINT | FK -> User, OneToOne, CASCADE, NOT NULL | role=TRAINER enforced in app layer |
+| full_name | VARCHAR(255) | NOT NULL | business identity (took over the identity role of the removed `User` link) |
+| phone | VARCHAR(32) | NULL | |
+| email | VARCHAR(254) | NULL | |
 | specialization | VARCHAR(128) | NULL | |
 | bio | TEXT | NULL | |
-| is_accepting_members | BOOLEAN | NOT NULL DEFAULT TRUE |ADMIN assignment aid |
+| status | VARCHAR(16) | NOT NULL | ACTIVE / INACTIVE (record lifecycle: deactivate, never physically delete casually) |
+| is_accepting_members | BOOLEAN | NOT NULL DEFAULT TRUE | ADMIN assignment aid |
+| created_at | TIMESTAMPTZ | NOT NULL | |
+
+Index: suggested `idx_trainer_fullname` for later search UX. This record holds no password/username/credential columns by design (BR-TRN-01).
 
 #### TrainerAssignment (append-only history)
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
 | id | BIGINT | PK | |
 | member_id | BIGINT | FK -> Member, PROTECT, NOT NULL | |
-| trainer_id | BIGINT | FK -> User, PROTECT, NOT NULL (role TRAINER) | |
+| trainer_id | BIGINT | FK -> Trainer, PROTECT, NOT NULL | references the `Trainer` business record (no login identity) |
 | assigned_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | ADMIN (BR-TRN-02) |
 | assigned_at | TIMESTAMPTZ | NOT NULL | |
 | unassigned_at | TIMESTAMPTZ | NULL | closes the row (BR-TRN-06) |
@@ -223,7 +238,7 @@ Immutability rule: never edited destructively; new states = new rows. Multiple-a
 |---|---|---|---|
 | id | BIGINT | PK | |
 | member_id | BIGINT | FK -> Member, PROTECT, NOT NULL | |
-| created_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | trainer (BR-WKO-01) — object-level ownership check |
+| created_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | ADMIN (BR-WKO-01 amended 2026-11-06; former trainer ownership object check retired with the trainer login role) |
 | title | VARCHAR(128) | NOT NULL | |
 | description | TEXT | NULL | |
 | start_date | DATE | NULL | |
@@ -253,7 +268,7 @@ Immutability rule: never edited destructively; new states = new rows. Multiple-a
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
 | id | BIGINT | PK | |
-| trainer_id | BIGINT | FK -> User, PROTECT, NOT NULL | |
+| trainer_id | BIGINT | FK -> Trainer, PROTECT, NOT NULL | references the `Trainer` business record |
 | member_id | BIGINT | FK -> Member, PROTECT, NOT NULL | |
 | workout_plan_id | BIGINT | FK -> WorkoutPlan, SET_NULL, NULL | optional context |
 | day_of_week | VARCHAR(9) | NOT NULL | |
@@ -309,7 +324,7 @@ Seven seeded categories: RENT, UTILITIES, STAFF_SALARIES, EQUIPMENT_MAINTENANCE,
 |---|---|---|---|
 | id | BIGINT | PK | |
 | category_id | BIGINT | FK -> ExpenseCategory, PROTECT, NOT NULL | |
-| recorded_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | accountant (never self-approves, BR-EXP-04) |
+| recorded_by_id | BIGINT | FK -> User, PROTECT, NOT NULL | ADMIN records expenses (duty consolidated 2026-11-06, BR-EXP-01); must differ from the deciding user (BR-EXP-04) |
 | amount | NUMERIC(12,2) | NOT NULL, CHECK > 0 | |
 | expense_date | DATE | NOT NULL | |
 | description | TEXT | NOT NULL | what was purchased |
@@ -384,7 +399,9 @@ Append-only (BR-AUD-03); indexes: (occurred_at), (object_type, object_id), (acto
 | `Receipt` | KEPT separate from Payment | Distinct receipt numbering/issuance concerns; keeps Payment purely financial |
 | `BiometricDevice` + `AccessDevice` | KEPT separate | Verification endpoint vs unlock endpoint are different roles in the access flow; a combined terminal can pair via `AccessDevice.biometric_device_id` |
 | `BiometricVerification` (as a standalone table) | NOT ADDED | Merged into `AccessAttempt` (AD-08): one event chain = verify then authorize; avoids near-duplicate rows |
-| `TrainerProfile` | KEPT | Clean extension of trainer staff without corrupting `User` with domain data |
+| `TrainerProfile` → **`Trainer`** | KEPT (retitled standalone) | Originally kept as a clean extension of trainer staff. Amended 2026-11-06 (AD-13): with trainers holding no login accounts, the record becomes a standalone ADMIN-managed `Trainer` entity with its own basic identity fields; the `User` OneToOne FK and role enforcement were removed. The trainer business functionality (records + assignment history) is fully preserved |
+| Separate staff-access event entity | NOT ADDED | One event chain per AD-08: `AccessAttempt.identity_kind` distinguishes member (biometric) vs staff (card/PIN) events; avoids a near-duplicate table (BR-ACC-11) |
+| New entity for offline access cache | NOT ADDED | The secure offline entitlement cache lives on the device gateway (hardware boundary, BR-ACC-07 confirmed 2026-11-06); PostgreSQL stores no entitlement cache — synchronized events land in `AccessAttempt`/`AttendanceSession` |
 | `Role` | KEPT as lookup | Stable FK integrity + auditable role assignment; Django Groups recommended for token-level permissions (mapped role->group) |
 | New entity for plan price history | NOT ADDED | `Membership.agreed_price` + immutable payments already preserve pricing history; avoid table creep |
 | New member-login entity | NOT ADDED | Member portal excluded from v1 scope |
@@ -392,8 +409,8 @@ Append-only (BR-AUD-03); indexes: (occurred_at), (object_type, object_id), (acto
 ## 4. Integrity & Historical Preservation
 
 ### 4.1 Delete policy
-- Master/financial rows use `PROTECT`: Member, MembershipPlan, Payment/Membership links, ExpenseCategory, Equipment, Exercise, BiometricDevice (only soft-disable via is_active).
-- Physical deletes are reserved for meaningless-without-parent rows (Receipt w/o Payment, NotificationDelivery w/o Notification) or profile extensions (TrainerProfile w/ User).
+- Master/financial rows use `PROTECT`: Member, MembershipPlan, Payment/Membership links, ExpenseCategory, Equipment, Exercise, BiometricDevice, **Trainer** (only soft-disable via `is_active`/`status`, following the staff deactivation policy).
+- Physical deletes are reserved for meaningless-without-parent rows (Receipt w/o Payment, NotificationDelivery w/o Notification). The former `TrainerProfile` CASCADE-on-User case disappeared with the 2026-11-06 amendment: `Trainer` is now master data and is PROTECTed, never deleted destructively.
 - Staff users DELETE ONLY via documented admin deactivation policy (is_active=FALSE) — the design never encourages user deletion.
 - CASCADE only where a child truly cannot exist alone.
 
@@ -406,7 +423,7 @@ Append-only (BR-AUD-03); indexes: (occurred_at), (object_type, object_id), (acto
 - Recommended DB-level guard: before-update triggers guarding these tables in the migration phase (implementation-time decision; documented requirement).
 
 ### 4.3 Snapshot (denormalized) fields — justified
-- `Membership.agreed_price`, `start_date`, `end_date`: membership history must not shift when plans change. These are immutable after creation (except the unresolved start-date policy decision).
+- `Membership.agreed_price`, `start_date`, `end_date`: membership history must not shift when plans change. These are immutable **after activation** — per the confirmed start-date policy (BR-MEM-13, 2026-11-06) `start_date` = date of full payment, with `end_date` computed from plan duration at activation.
 - Everything else derived (outstanding balances, P&L, elapsed time) is COMPUTED — no stored counters (avoiding drift).
 
 ### 4.4 Referential uniqueness summaries
@@ -418,10 +435,10 @@ Append-only (BR-AUD-03); indexes: (occurred_at), (object_type, object_id), (acto
 
 ## 5. Seeded Reference Data (later phase, listed for completeness)
 
-Roles: ADMIN, RECEPTIONIST, TRAINER, ACCOUNTANT. Plans: five fixed codes with prices set by ADMIN first. Expense categories: seven codes above. Notification channels: IN_APP, SMS, EMAIL. Migration data only — nothing executed yet.
+Roles: **ADMIN, RECEPTIONIST** only (exactly two staff login roles — AD-13; no TRAINER or ACCOUNTANT rows are seeded). Plans: five fixed codes with prices set by ADMIN first. Expense categories: seven codes above. Payment methods: CASH, MOBILE_MONEY, CARD, BANK_TRANSFER (confirmed BR-MEM-14). Notification channels: IN_APP, SMS, EMAIL. Migration data only — nothing executed yet.
 
 ## 6. PostgreSQL-Specific Notes
 
-- Version: PostgreSQL 17 vs 18 (installed) — UNRESOLVED; this design is version-agnostic; selection precedes the database phase.
+- Version: **PostgreSQL 18 — confirmed** (2026-11-06, AD-14; matches the installed local service `postgresql-x64-18`); connection/migrations still belong to the database phase.
 - No database, schema, user, role, table, index or constraint has been created in this phase. Concurrency/locking and trigger-guard migrations belong to the DB implementation phase.
 - Character encoding UTF-8 default; time zone storage UTC via TIMESTAMPTZ; Africa/Nairobi as display setting (already configured in project settings).

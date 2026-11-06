@@ -1,8 +1,10 @@
 # Business Rules — Gym Management System
 
 **Status:** Rule catalog derived from the confirmed requirements (Phase 2). Rules marked **[CONFIRMED]** come directly from the user's decisions; **[REC]** are architect recommendations proposed for confirmation; **[UNRESOLVED]** flag open policy questions (tracked in [`../progress/phase-2-architecture.md`](../progress/phase-2-architecture.md)). No rule is implemented yet.
+**Amended 2026-11-06 (role consolidation):** exactly two staff login roles exist — ADMIN and RECEPTIONIST. Trainers and accountants hold no login accounts; their functionality remains as ADMIN-managed business modules (see [`../progress/phase-3-decisions.md`](../progress/phase-3-decisions.md) and decision AD-13).
+**Amended 2026-11-06 (second amendment — confirmed operational decisions, AD-14):** PostgreSQL 18; single currency KES; payment methods CASH, MOBILE_MONEY, CARD, BANK_TRANSFER; cash-basis accounting; membership starts on the date full payment is received; offline access fails closed via a secure cache with expiry and event synchronization; staff physical access via individual cards or PINs. The affected rules below carry [CONFIRMED — resolved 2026-11-06] markers; the full record is phase-3-decisions.md §7.
 
-Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), REG (registration), ATT (attendance), BIO (biometrics), ACC (physical access), TRN (trainers), EXP (expenses), NTF (notifications), EQP (equipment), FIN (finance/reporting), AUD (audit).
+Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), REG (registration), ATT (attendance), BIO (biometrics), ACC (physical access), TRN (trainers), WKO (workouts), EXP (expenses), NTF (notifications), EQP (equipment), FIN (finance/reporting), AUD (audit).
 
 ---
 
@@ -22,9 +24,9 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 | BR-MEM-10 | Inactive/EXPIRED memberships keep all payment records and receipts; the price, start date and end date snapshotted on the membership never change if plans become invalid or re-priced later. | [CONFIRMED] |
 | BR-MEM-11 | Membership price is captured as `agreed_price` at enrollment time (price at plan selection), independent of later plan price changes. | [REC] |
 | BR-MEM-12 | Expiry: an ACTIVE membership whose `end_date` has passed becomes EXPIRED via the membership status service (planned daily maintenance job + on-read evaluation at access/decision points). | [REC] |
-| BR-MEM-13 | **Membership start-date policy is UNRESOLVED**: two candidate policies exist — (a) membership starts on the registration/enrollment date, (b) membership starts on the moment of full payment. Impact analysis: earlier start under policy (a) shortens paid-up utilization if payment comes late. **Recommendation: policy (b) — the paid window should start when payment completes; not silently finalized.** | [UNRESOLVED] |
-| BR-MEM-14 | Payment method set is not finalized. Candidate set (recommendation only): CASH, MOBILE MONEY, CARD, BANK TRANSFER. Methods recorded per payment; currency-related terms are tracked in the unresolved register. | [UNRESOLVED] |
-| BR-MEM-15 | Currency is not finalized (recommendation: single-currency gym, e.g., KES given Africa/Nairobi context); amounts stored as decimal money values; multi-currency support deferred until confirmed. | [UNRESOLVED] |
+| BR-MEM-13 | **Membership start-date policy CONFIRMED (2026-11-06): policy (b)** — a membership starts on the **date its full payment is received** (outstanding balance reaches zero); `start_date` and `end_date` are set at activation and snapshot thereafter. Impact note: registration may precede the paid window; no entry/service before activation (BR-ACC-02). | [CONFIRMED — resolved 2026-11-06] |
+| BR-MEM-14 | Payment methods CONFIRMED (2026-11-06): **CASH, MOBILE_MONEY, CARD, BANK_TRANSFER**. Exactly one method is recorded per payment. | [CONFIRMED — resolved 2026-11-06] |
+| BR-MEM-15 | Currency CONFIRMED (2026-11-06): **single-currency gym in KES**; amounts stored as decimal money values; multi-currency support remains out of scope. | [CONFIRMED — resolved 2026-11-06] |
 | BR-MEM-16 | Receipt: every COMPLETED payment yields a receipt with a unique sequential number; a payment has at most one receipt. | [CONFIRMED receipts; REC numbering] |
 
 ## 2. Member Registration
@@ -55,7 +57,7 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 
 | ID | Rule | Status |
 |---|---|---|
-| BR-BIO-01 | Fingerprint and facial verification are supported modalities. | [CONFIRMED] |
+| BR-BIO-01 | Fingerprint and facial verification are supported modalities for member verification. Staff use individually assigned cards or PINs as their standard physical access method; optional staff biometric access is permitted under BR-ACC-11. | [CONFIRMED — amended 2026-11-06] |
 | BR-BIO-02 | Raw fingerprint images and raw facial images are never stored in attendance records — or anywhere in this application's data store. The system stores only device-side template references. | [CONFIRMED] |
 | BR-BIO-03 | Biometric templates are managed and matched by the biometric devices themselves (edge matching); Django handles mapping and authorization, never template matching. | [CONFIRMED architectural stance] |
 | BR-BIO-04 | Secure mapping: `Member ↔ (device, modality, template reference, status)`. The mapping row is created at enrollment and revoked (never re-used) on removal; a member may be enrolled on multiple devices. | [CONFIRMED] |
@@ -72,19 +74,20 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 | BR-ACC-04 | All access attempts — granted, denied, and overridden — are logged with identity, verification result, decision, reason, device, and timestamp. | [CONFIRMED] |
 | BR-ACC-05 | Receptionist override is possible and only IF specifically authorized (permission matrix) and always produces an audited override record (actor + reason). | [CONFIRMED audited override permissioning] |
 | BR-ACC-06 | **Emergency exit must never depend on membership validation, the backend, or internet connectivity**; emergency exits are mechanical safety functions outside the authorization path. | [CONFIRMED] |
-| BR-ACC-07 | When the backend, network, or hardware is unavailable the system must fail safe. Recommendation: automated authorization defaults to deny; the gateway buffers events and replays them on recovery; receptionist manual override is the documented human fallback. Final policy (fail-open vs fail-closed trade-offs) is UNRESOLVED. | [UNRESOLVED — REC fail-closed + replay] |
+| BR-ACC-07 | CONFIRMED (2026-11-06): when the backend, network, or hardware path is unavailable the system fails **closed**. The device gateway denies scripted online authorization, serves a **secure offline access cache** of recent entitlement data whose entries **expire** (stale authorizations never grant entry indefinitely), buffers local events and **synchronizes** them — replaying into `AccessAttempt`/`AttendanceSession` — on recovery; the receptionist manual override remains the documented human fallback. The cache expiry window and refresh policy are implementation parameters pending confirmation. | [CONFIRMED — core policy; expiry parameter open] |
 | BR-ACC-08 | Door/turnstile unlock is executed by the device gateway service, not by Django directly; the backend emits authorization events and does not talk to raw hardware. | [CONFIRMED boundary] |
 | BR-ACC-09 | Whether entry and exit use the same biometric terminal or separate entry/exit readers is UNRESOLVED. The domain model records entry and exit as separate events so both topologies are supported. | [UNRESOLVED] |
 | BR-ACC-10 | Door controller protocol/API is UNRESOLVED — no hardware assumptions; integration is an abstract contract (authorize/deny/unlock command + event callback) until a controller is selected. | [UNRESOLVED] |
+| BR-ACC-11 | Staff physical access (confirmed 2026-11-06): ADMIN and RECEPTIONIST staff use **individually assigned access cards or PINs** as their standard physical access method. Staff biometric enrollment is OPTIONAL — permitted, not prohibited (biometric clause amended 2026-11-06 from "staff are never biometrically enrolled"). When staff biometric access is configured, it must identify the individual staff account (`identity_kind = STAFF`) and must never be treated as member access. Staff access — card/PIN or staff biometric — bypasses member subscription and payment validation (BR-ACC-01/BR-ACC-02 eligibility gates apply to member events only). Staff entry and exit events are captured in `AccessAttempt` (`identity_kind = STAFF`, actor = the individual staff `User`) and audited (BR-AUD-01); card/PIN issuance and revocation are ADMIN-only. | [CONFIRMED — amended 2026-11-06] |
 
 ## 6. Trainer Management & Workouts
 
 | ID | Rule | Status |
 |---|---|---|
-| BR-TRN-01 | ADMIN creates trainer staff accounts (no self-service trainer registration). | [CONFIRMED] |
-| BR-TRN-02 | ADMIN assigns members to trainers, changes assignments, and removes them; every change appends to assignment history (never destructive editing). | [CONFIRMED] |
-| BR-TRN-03 | Trainers access ONLY their assigned members' training information (workout plans, schedules, attendance history). Trainer access is enforced at the API object level. | [CONFIRMED] |
-| BR-TRN-04 | Trainers cannot access financial management or system administration in any form. | [CONFIRMED] |
+| BR-TRN-01 | Trainers hold **NO login accounts and no staff credentials**; trainers exist as ADMIN-managed business records (`Trainer`) with no authentication data of any kind. (Amended 2026-11-06 from "ADMIN creates trainer staff accounts".) | [CONFIRMED] |
+| BR-TRN-02 | ADMIN manages trainer records and assigns members to trainers, changes assignments, and removes them; every change appends to assignment history (never destructive editing). | [CONFIRMED] |
+| BR-TRN-03 | Trainer-related data (records, assignments, training schedules) is system data: ADMIN has full access; RECEPTIONIST has read-only member-facing views (e.g., a member's current trainer). No authorization scope is derived from a trainer identity because trainers do not authenticate. | [CONFIRMED — amended 2026-11-06] |
+| BR-TRN-04 | No API role, permission group, or login identity exists for trainers; all trainer management, workout-plan and training-schedule operations are performed exclusively through ADMIN staff accounts. | [CONFIRMED — amended 2026-11-06] |
 | BR-TRN-05 | Whether a member may be assigned to multiple trainers simultaneously is pending — recommendation: primary trainer + optional co-trainers. Affects the uniqueness constraint design. | [UNRESOLVED] |
 | BR-TRN-06 | Assignment history is immutable: rows close with an end date/cause (e.g., reassigned, removed); past assignments are never deleted. | [REC] |
 
@@ -92,9 +95,9 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 
 | ID | Rule | Status |
 |---|---|---|
-| BR-WKO-01 | Workout plans are created by trainers for their own assigned members; ADMIN may view/manage all. | [CONFIRMED scope; REC ownership check] |
+| BR-WKO-01 | Workout plans are created and managed by **ADMIN** (amended 2026-11-06 — trainers hold no login accounts); each plan stays linked to its member and may reference the responsible `Trainer` record for context. | [CONFIRMED — amended from trainer-created plans] |
 | BR-WKO-02 | A plan contains exercises with per-line guidance (e.g., sets/reps/notes) and ordering; the exercise library is shared across the gym. | [REC] |
-| BR-WKO-03 | Training schedules bind trainer + member + time slot; collisions (same member double-booked) are validated at save time. | [REC] |
+| BR-WKO-03 | Training schedules bind trainer + member + time slot (trainer references the `Trainer` business record, not a login identity); collisions (same member double-booked) are validated at save time. | [REC] |
 
 ## 7. Equipment
 
@@ -109,10 +112,10 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 
 | ID | Rule | Status |
 |---|---|---|
-| BR-EXP-01 | ACCOUNTANT records expenses from confirmed categories: RENT, UTILITIES (electricity & water), STAFF_SALARIES, EQUIPMENT_MAINTENANCE, CLEANING, INTERNET, OTHER. | [CONFIRMED] |
+| BR-EXP-01 | **ADMIN** records expenses from confirmed categories: RENT, UTILITIES (electricity & water), STAFF_SALARIES, EQUIPMENT_MAINTENANCE, CLEANING, INTERNET, OTHER. (Amended 2026-11-06: formerly the accountant's duty; no accountant role exists.) | [CONFIRMED] |
 | BR-EXP-02 | Workflow: `PENDING_APPROVAL → APPROVED | REJECTED`. Only ADMIN decides; decisions (who, when, decision, reason) are stored as immutable `ExpenseApproval` records. | [CONFIRMED] |
 | BR-EXP-03 | Rejection requires a documented reason. | [CONFIRMED] |
-| BR-EXP-04 | An accountant can NEVER approve their own expense (object-level rule separate from role permissions). | [CONFIRMED] |
+| BR-EXP-04 | The user who recorded an expense can NEVER approve it (object-level rule separate from role permissions); a different ADMIN user must grant every approval/rejection. (Amended 2026-11-06 from "an accountant can never approve their own expense" — preserves the separation-of-duties intent after role consolidation.) | [CONFIRMED — adapted] |
 | BR-EXP-05 | Approved expenses are protected from silent modification; corrections go through reversal/adjustment records with approval trail. Pending and rejected expenses are excluded from approved expense totals. | [CONFIRMED] |
 | BR-EXP-06 | Approved expense decisions appear in financial reports. | [CONFIRMED] |
 
@@ -134,7 +137,7 @@ Rule ID convention: `BR-<DOMAIN>-<NN>` with domains MEM (memberships/payments), 
 | BR-FIN-02 | Partial payments remain individually identifiable in reports (never averaged away or bundled). | [CONFIRMED] |
 | BR-FIN-03 | Approved expense totals exclude pending and rejected expenses. | [CONFIRMED] |
 | BR-FIN-04 | Reports include daily payment summaries, weekly/monthly revenue, membership payment reports, outstanding balances, expense reports, equipment maintenance costs, P&L, and KPI dashboards. | [CONFIRMED] |
-| BR-FIN-05 | Accounting basis (cash vs accrual) is UNRESOLVED. Recommendation: cash basis (revenue = received payments; expense = approved expense decisions), simple and reconcilable for a single gym. | [UNRESOLVED] |
+| BR-FIN-05 | Accounting basis CONFIRMED (2026-11-06): **cash basis** — revenue = received (COMPLETED) payments; expense = approved expense decisions; simple and reconcilable for a single gym. | [CONFIRMED — resolved 2026-11-06] |
 | BR-FIN-06 | Financial corrections must be auditable: payments can only be reversed (reversal records linked to the original), expenses corrected through approval trail — never blanked. | [CONFIRMED] |
 | BR-FIN-07 | P&L = Σ COMPLETED payments − Σ approved (current) expenses within the period; both legs exclude pending/void/rejected items. | [REC] |
 

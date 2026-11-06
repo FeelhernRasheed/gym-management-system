@@ -1,6 +1,8 @@
 # ERD — Gym Management System
 
 **Status:** Logical model (Phase 2, documentation only — no schema exists yet). Model-class names are shown as entities; Django will generate physical tables (`<app>_<model>`) in a later phase. Attribute lists are summarized (types/constraints are normative in [`database-design.md`](database-design.md)).
+**Amended 2026-11-06 (role consolidation, AD-13):** `TRAINER_PROFILE` (a `User` OneToOne extension) was replaced by the standalone **`TRAINER`** business record — trainers hold no login accounts; the USER↔TRAINER edge no longer exists.
+**Amended 2026-11-06 (second amendment, AD-14):** `ACCESS_ATTEMPT` extended for staff card/PIN access events (`identity_kind`, `staff_actor_id`; the biometric-device edge becomes member-event specific); membership dates resolved (start = date of full payment, set at activation).
 
 Mermaid notation: `||` exactly one · `|o` zero or one · `o{` zero or more. A dashed meaning is not used; every edge below maps to a foreign key listed in §2.
 
@@ -113,6 +115,8 @@ erDiagram
         bigint id PK
         timestamptz occurred_at
         bigint member_id FK
+        bigint staff_actor_id FK
+        varchar identity_kind
         bigint biometric_device_id FK
         bigint access_device_id FK
         varchar modality
@@ -122,11 +126,14 @@ erDiagram
         bigint override_by_id FK
         text override_reason
     }
-    TRAINER_PROFILE {
+    TRAINER {
         bigint id PK
-        bigint user_id FK
+        varchar full_name
+        varchar phone
+        varchar email
         varchar specialization
         text bio
+        varchar status
         boolean is_accepting_members
     }
     TRAINER_ASSIGNMENT {
@@ -255,7 +262,6 @@ erDiagram
     }
 
     ROLE ||--o{ USER : "assigned role"
-    USER |o--o| TRAINER_PROFILE : "trainer profile (trainers only)"
     MEMBER ||--o{ MEMBERSHIP : "membership history"
     MEMBERSHIP_PLAN ||--o{ MEMBERSHIP : "plan"
     MEMBERSHIP ||--o{ PAYMENT : "payments"
@@ -271,15 +277,16 @@ erDiagram
     BIOMETRIC_DEVICE ||--o{ ACCESS_ATTEMPT : "verified on"
     ACCESS_DEVICE |o--o{ ACCESS_ATTEMPT : "door decision context"
     USER |o--o{ ACCESS_ATTEMPT : "override_by"
+    USER |o--o{ ACCESS_ATTEMPT : "staff_actor (card/PIN)"
     ACCESS_DEVICE |o--o| BIOMETRIC_DEVICE : "optional paired terminal"
     MEMBER ||--o{ TRAINER_ASSIGNMENT : "assignments"
-    USER ||--o{ TRAINER_ASSIGNMENT : "trainer"
+    TRAINER ||--o{ TRAINER_ASSIGNMENT : "trainer"
     USER ||--o{ TRAINER_ASSIGNMENT : "assigned_by"
     MEMBER ||--o{ WORKOUT_PLAN : "plans for"
-    USER ||--o{ WORKOUT_PLAN : "created_by"
+    USER ||--o{ WORKOUT_PLAN : "created_by (ADMIN)"
     WORKOUT_PLAN ||--o{ WORKOUT_PLAN_EXERCISE : "includes"
     EXERCISE ||--o{ WORKOUT_PLAN_EXERCISE : "used in"
-    USER ||--o{ TRAINING_SCHEDULE : "trainer"
+    TRAINER ||--o{ TRAINING_SCHEDULE : "trainer"
     MEMBER ||--o{ TRAINING_SCHEDULE : "scheduled"
     WORKOUT_PLAN |o--o{ TRAINING_SCHEDULE : "plan context"
     EQUIPMENT_CATEGORY ||--o{ EQUIPMENT : "categorizes"
@@ -299,7 +306,6 @@ erDiagram
 | Edge | FK field | On-target entity | Null? | on_delete plan |
 |---|---|---|---|---|
 | ROLE -> USER | `User.role_id` | User | No | PROTECT |
-| USER -> TRAINER_PROFILE | `TrainerProfile.user_id` | User (role TRAINER) | No | CASCADE (profile extension) |
 | MEMBER -> MEMBERSHIP | `Membership.member_id` | Member | No | PROTECT |
 | MEMBERSHIP_PLAN -> MEMBERSHIP | `Membership.plan_id` | MembershipPlan | No | PROTECT |
 | MEMBERSHIP -> PAYMENT | `Payment.membership_id` | Membership | No | PROTECT |
@@ -311,19 +317,20 @@ erDiagram
 | MEMBER -> BIOMETRIC_ENROLLMENT | `BiometricEnrollment.member_id` | Member | No | PROTECT |
 | BIOMETRIC_DEVICE -> BIOMETRIC_ENROLLMENT | `BiometricEnrollment.device_id` | BiometricDevice | No | PROTECT |
 | USER -> BIOMETRIC_ENROLLMENT | `BiometricEnrollment.enrolled_by_id` | User | No | PROTECT |
-| MEMBER -> ACCESS_ATTEMPT | `AccessAttempt.member_id` | Member | **Yes** (unknown identity) | SET_NULL |
-| BIOMETRIC_DEVICE -> ACCESS_ATTEMPT | `AccessAttempt.biometric_device_id` | BiometricDevice | No | PROTECT |
+| MEMBER -> ACCESS_ATTEMPT | `AccessAttempt.member_id` | Member | **Yes** (unknown identity / staff event) | SET_NULL |
+| BIOMETRIC_DEVICE -> ACCESS_ATTEMPT | `AccessAttempt.biometric_device_id` | BiometricDevice | **Yes** (required for MEMBER rows; NULL for staff card/PIN events) | PROTECT |
+| USER -> ACCESS_ATTEMPT | `AccessAttempt.staff_actor_id` | User (acting staff for card/PIN events) | **Yes** (member events) | SET_NULL |
 | ACCESS_DEVICE -> ACCESS_ATTEMPT | `AccessAttempt.access_device_id` | AccessDevice | **Yes** (verification w/o door) | SET_NULL |
 | USER -> ACCESS_ATTEMPT | `AccessAttempt.override_by_id` | User | **Yes** | SET_NULL |
 | ACCESS_DEVICE -> BIOMETRIC_DEVICE | `AccessDevice.biometric_device_id` | BiometricDevice | **Yes** (pairing optional) | SET_NULL |
 | MEMBER -> TRAINER_ASSIGNMENT | `TrainerAssignment.member_id` | Member | No | PROTECT |
-| USER -> TRAINER_ASSIGNMENT | `TrainerAssignment.trainer_id` | User (role TRAINER) | No | PROTECT |
+| TRAINER -> TRAINER_ASSIGNMENT | `TrainerAssignment.trainer_id` | Trainer (business record, no login) | No | PROTECT |
 | USER -> TRAINER_ASSIGNMENT | `TrainerAssignment.assigned_by_id` | User (ADMIN) | No | PROTECT |
 | MEMBER -> WORKOUT_PLAN | `WorkoutPlan.member_id` | Member | No | PROTECT |
-| USER -> WORKOUT_PLAN | `WorkoutPlan.created_by_id` | User (TRAINER) | No | PROTECT |
+| USER -> WORKOUT_PLAN | `WorkoutPlan.created_by_id` | User (ADMIN — amended 2026-11-06) | No | PROTECT |
 | WORKOUT_PLAN -> WORKOUT_PLAN_EXERCISE | `WorkoutPlanExercise.workout_plan_id` | WorkoutPlan | No | CASCADE |
 | EXERCISE -> WORKOUT_PLAN_EXERCISE | `WorkoutPlanExercise.exercise_id` | Exercise | No | PROTECT |
-| USER -> TRAINING_SCHEDULE | `TrainingSchedule.trainer_id` | User | No | PROTECT |
+| TRAINER -> TRAINING_SCHEDULE | `TrainingSchedule.trainer_id` | Trainer (business record, no login) | No | PROTECT |
 | MEMBER -> TRAINING_SCHEDULE | `TrainingSchedule.member_id` | Member | No | PROTECT |
 | WORKOUT_PLAN -> TRAINING_SCHEDULE | `TrainingSchedule.workout_plan_id` | WorkoutPlan | **Yes** | SET_NULL |
 | EQUIPMENT_CATEGORY -> EQUIPMENT | `Equipment.category_id` | EquipmentCategory | No | PROTECT |
@@ -338,6 +345,7 @@ erDiagram
 | USER -> AUDIT_LOG | `AuditLog.actor_id` | User | **Yes** (SYSTEM) | SET_NULL |
 
 Note: there is intentionally **no User-Member FK** in the diagram — staff identities are not member identities (AD-02); the domains connect through domain entities (memberships, payments, assignments, etc.) only.
+Likewise there is **no User-Trainer FK**: `TRAINER` is a standalone business record with no login identity (AD-13, amended 2026-11-06), reached only through assignment/schedule relationships; it is not a separate authentication model.
 
 ## 3. Cardinality Notes Justifying the Model
 
@@ -351,3 +359,5 @@ Note: there is intentionally **no User-Member FK** in the diagram — staff iden
 8. **Notification 1:N NotificationDelivery** — per-channel outcome tracking (BR-NTF-03).
 9. **BiometricEnrollment** — the member <-> device/modality/template mapping with revocation; multiple devices supported (BR-BIO-04).
 10. **AuditLog** — polymorphic target with null-able SYSTEM actor (BR-AUD-04).
+11. **AccessAttempt one chain, two identity kinds** — member biometric events (`identity_kind = MEMBER`, biometric terminal, FINGERPRINT/FACIAL) and staff card/PIN events (`identity_kind = STAFF`, `staff_actor_id` → User) share one event/decision model per AD-08; biometric enrollment itself stays member-only (BR-BIO, BR-ACC-11 confirmed 2026-11-06).
+12. **Membership dates set at activation** — `start_date` = date the full payment is received (BR-MEM-13 confirmed 2026-11-06); `end_date` = start + plan duration; both immutable thereafter (BR-MEM-10).
